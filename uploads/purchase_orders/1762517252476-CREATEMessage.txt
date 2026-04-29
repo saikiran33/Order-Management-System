@@ -1,0 +1,1205 @@
+var TenantDbManager = require("../../../db/TenantDbManager");
+var AuthDbManager = require("../../../db/AuthDbManager");
+let axios = require("axios");
+var Promise = require("bluebird");
+var _ = require("lodash");
+var franc = require("franc");
+var debug = require("debug")("create-message");
+var logicadapters = require("./logicadapters");
+var errors = require("http-errors");
+var moment = require("moment");
+var config = require("../../../config");
+var ExecutionResults = require("./components/dialog-state/holders/ExecutionResults");
+var FallbackNotificationService = require("../../../services/FallbackNotificationService");
+var Monitor = require("../../monitor");
+var FileUploadMiddleware = require("../../middleware/FileUpload");
+const USELOCAL = config.get("uploads.useLocal");
+const UTCOFFSET = config.get("timeZone.utcOffset");
+var ProcessingScopeBuilder = require("./components/ProcessingScopeBuilder");
+var NLPComponent = require("./components/NlpPipelineComponent");
+var ResponderComponent = require("./components/ResponderComponent");
+var IntentActionsComponent = require("./components/IntentActionsComponent");
+var ContextNodesComponent = require("./components/ContextNodesComponent");
+var WikiComponent = require("./components/WikiComponent");
+var ContextManagerComponent = require("./components/ContextManagerComponent");
+
+
+function generateFriendlyFallback(userMessage, nlpInfo = {}, confidence = 0.0) {
+  const sentiment = _.get(nlpInfo, 'sentimentInfo.label', 'neutral');
+  const keywords = _.get(nlpInfo, 'keywords', []);
+  const lang = _.get(nlpInfo, 'lngInfo.label', 'en');
+
+  const templates = {
+    positive: [
+      "That's interesting! Could you tell me more?",
+      "Sounds great! What would you like help with?",
+      "I'm excited to assist you. Can you clarify your request?"
+    ],
+    neutral: [
+      "I'm here to help. Could you please rephrase your question?",
+      "Can you give me a bit more detail so I can assist better?",
+      "Let’s try again—what exactly do you need help with?"
+    ],
+    negative: [
+      "I understand this might be frustrating. Can you clarify?",
+      "Sorry, I didn’t catch that. Could you try asking differently?",
+      "Let me help you better—can you rephrase your question?"
+    ]
+  };
+
+  const fallbackOptions = templates[sentiment] || templates.neutral;
+
+  if (keywords.length > 0) {
+    const keyword = keywords[0];
+    return `I noticed you mentioned "\${keyword}". Could you tell me more about that?`;
+  }
+
+  if (confidence < 0.3) {
+    return fallbackOptions[Math.floor(Math.random() * fallbackOptions.length)];
+  }
+
+  return "I'm not sure I understood that. Could you please clarify?";
+}
+
+
+var PromptsHandler = require("./components/dialog-state/PromptsHandler");
+var PendingInfoHandler = require("./components/dialog-state/PendingInfoHandler");
+var ExecutionContextProvider = require("./components/dialog-state/ExecutionContextProvider");
+var ConversationMemoryHandler = require("./components/dialog-state/MemoryHandler");
+var ContextMessageProvider = require("./components/dialog-state/ContextMessageProvider");
+
+var MemCache = require("../../../services/MemCache");
+var eventUtils = require("../../analytics/events/utils/eventUtils");
+const MemoryHandler = require("./components/dialog-state/MemoryHandler");
+
+function getMessageCacheKey(scope) {
+  var eventName = _.get(scope.req, "body.event.name");
+  var preferredLang = _.get(scope.req, "body.preferences.lang") || "en";
+  var key =
+    (eventName ? eventName : "welcomeMessage") +
+    "_" +
+    scope.req.body.instanceName +
+    "_" +
+    preferredLang;
+  return key;
+}
+
+async function updateMemory(scope) {
+  var messageType = scope.req.body.messageType;
+  var customParams = _.get(scope.req.body, "customParams");
+  var agentData = _.get(scope.req.body, "agentData");
+  if (messageType === 0 && customParams) {
+    await MemoryHandler.updateBotMemory(
+      scope,
+      scope.conversation,
+      customParams
+    );
+  }
+  if (!_.isEmpty(agentData)) {
+    await MemoryHandler.updateBotMemory(scope, scope.conversation, agentData);
+  }
+}
+
+async function checkAndCacheMessage(scope, cacheData) {
+  var cacheWelcome = _.get(scope.bot.settings, "cacheWelcome");
+  var messageType = scope.req.body.messageType;
+  var inputData = scope.inputData;
+  await updateMemory(scope);
+  // Cache only welcome messages when setting is enabled
+  if (messageType === 0 && !!cacheWelcome && !inputData.pendingInput) {
+    var key = getMessageCacheKey(scope);
+    MemCache.setEventMessage(scope.bot.id, key, cacheData);
+  }
+}
+
+async function checkForFallbackNotification(message) {
+  var scope = this;
+  var bot = scope.bot;
+  var fallbackNotificationEmail = bot.settings
+    ? bot.settings.fallbackNotificationEmail
+    : undefined;
+
+  if (fallbackNotificationEmail && message.didFallback) {
+    debug("checking for fallback notification");
+    var additionalInfo = {
+      userInfo: scope.userInfo,
+      suggestions: _.chain(message)
+        .get("info.botResponse")
+        .map("potentialAction")
+        .flatten()
+        .map("name")
+        .value(),
+    };
+    FallbackNotificationService.notify(
+      bot,
+      scope.conversation.id,
+      bot.botInfo.orgId,
+      fallbackNotificationEmail,
+      bot.settings.fallbackNotificationThreshold,
+      undefined,
+      additionalInfo
+    );
+  }
+
+  var fallbackToAgentNotificationConfig = bot.settings
+    ? bot.settings.fallbackToAgentConfig
+    : undefined;
+
+  if (
+    _.get(scope, "req.body.integration") !== "console" &&
+    message.didFallback
+  ) {
+    debug("checking for fallback notification");
+    let llmResp = false;
+    // console.log(`get the llm setting ${_.get(bot.settings,"enableLlmAction")}`);
+    if(_.get(bot.settings,"enableLlmAction")){
+      let requestData = { client_id: scope.botId, query: scope.message };
+    var options = {
+      url: "http://144.24.150.247:3013/queries/answer",
+      headers: {
+        "Content-type": "application/json",
+      },
+      method: "POST",
+      data: requestData,
+    };
+
+    var aiResp = await axios(options)
+      .then((resp) => {
+        return resp.data;
+      })
+      .catch((err) => {
+        debug(`the error in getting ai response is ${err.message}`);
+        return { has_relevant_context: false };
+      });
+      // console.log(`the response from llm is ${JSON.stringify(aiResp)}`)
+    if (aiResp.has_relevant_context) {
+      llmResp = true;
+      message.info.botResponse[0].text = aiResp.has_relevant_context ? aiResp.answer : generateFriendlyFallback(scope.message, scope.nlp, _.get(scope.similarityInfo, 'confidence', 0));
+    }
+    }
+    
+    var previousFallBackQueries = !llmResp ?
+      await FallbackNotificationService.notifyToAgent(
+        bot,
+        scope.conversation.id,
+        bot.botInfo.orgId,
+        fallbackNotificationEmail,
+        bot.settings.fallbackNotificationThreshold,
+        bot.settings.fallbackToAgentConfig
+      ) : null;
+    if (previousFallBackQueries) {
+      message["agentFallbacks"] = {
+        fallBackToAgent: true,
+        previousFallBackQueries: previousFallBackQueries,
+      };
+    }
+  }
+}
+
+async function sendResponse(message) {
+  var scope = this;
+  var isConsole = _.get(scope, "req.body.integration") === "console";
+  var botResponse = message.info.botResponse;
+  // console.log(`the bot response in send response is ${JSON.stringify(botResponse)}`);
+  var info = isConsole ? message : undefined;
+  var agentFallback = _.has(message, "agentFallbacks")
+    ? _.get(message, "agentFallbacks")
+    : undefined;
+  var didFallback = _.get(message, "didFallback");
+
+  var quickRepliesStyle;
+  var actionDelay;
+  var executedIntent = scope.executedIntent || scope.matchingIntent;
+  if (_.get(executedIntent, "settings")) {
+    quickRepliesStyle = executedIntent.settings.quickRepliesStyle
+      ? executedIntent && executedIntent.settings.quickRepliesStyle
+      : null;
+    actionDelay = executedIntent.settings.actionDelay
+      ? executedIntent && executedIntent.settings.actionDelay
+      : null;
+  }
+
+  var pendingParam = _.get(scope, "inputData.nextPendingParam");
+  var params = _.chain(scope.actionResults)
+    .map("responseContext.params")
+    .flatten()
+    .value();
+  var extractedParams = _.merge({}, ...params);
+  var memoryVariables = await MemoryHandler.getValuesFromBotMemory(
+    scope.conversation,
+    scope.bot
+  );
+  var additionalInfo = {
+    confidence: _.get(scope.similarityInfo, "confidence"),
+    sentiment: _.get(scope, "nlp.sentimentInfo"),
+    memoryInfo: memoryVariables,
+    language: {
+      query: _.get(scope.nlp, "lngInfo.label"),
+      response: _.get(scope.responseInfo || scope.promptInfo, "lngInfo.label"),
+      qr: _.get(scope.responseInfo || scope.promptInfo, "lngInfo.qrLabel"),
+      isLowConfidence: _.get(scope.nlp, "lngInfo.isLowConfidence"),
+      confidence: _.get(scope.nlp, "lngInfo.confidence"),
+    },
+    flowId: executedIntent.id,
+    extractedParams: extractedParams,
+    pending: {
+      type: _.get(pendingParam, "dataType"),
+    },
+    agentFallback: agentFallback,
+    didFallback: didFallback,
+    serviceInfo: {
+      serviceRequests: scope.serviceRequests,
+    },
+  };
+
+  var response = {
+    id: message.id,
+    name: executedIntent.name,
+    message: scope.message,
+    botResponse: botResponse,
+    info: info,
+    additionalInfo: additionalInfo,
+    didFallback: message.didFallback,
+  };
+
+  if (!!quickRepliesStyle && quickRepliesStyle.enabled) {
+    response["quickRepliesStyle"] = quickRepliesStyle;
+  }
+  if (!!actionDelay && actionDelay.enabled) {
+    response["actionDelay"] = actionDelay;
+  }
+  return response;
+}
+
+async function storeContext(message) {
+  var start = Date.now();
+  var scope = this;
+
+  var dialogContext = {};
+  var discoveryContext = {};
+
+  // TODO check for pending input dialog and retain the context if not completed
+  // clear context if number of tries maxes out
+  if (scope.matchingIntent && scope.matchingIntent.settings) {
+    debug("intent has settings, storing attributes in dialogContext");
+    var intentSettings = scope.matchingIntent.settings;
+    dialogContext.attributes = intentSettings.attributes;
+  }
+
+  if (_.get(scope.bot, "settings.retainFeatures")) {
+    dialogContext.features = _.get(scope.similarityInfo, "features");
+  }
+
+  dialogContext.actionContext = scope.actionContext;
+  var matchingIntentId = _.get(scope, "matchingIntent.id");
+  debug(
+    "actionContext category is %s",
+    _.get(scope, "actionContext." + matchingIntentId + ".categoryName")
+  );
+
+  var actionContext = _.get(scope, "actionContext");
+  var contextObj = {
+    discoveryContext: discoveryContext,
+    dialogContext: dialogContext,
+    actionContext: actionContext,
+  };
+
+  await PendingInfoHandler.addPendingContext(scope, contextObj);
+  PendingInfoHandler.addDiscoveryContext(scope, contextObj);
+  PromptsHandler.addPromptsContext(scope, contextObj);
+  var conversation = scope.conversation;
+  var inputData = scope.inputData;
+  var memory = await ConversationMemoryHandler.getPresistableMemory(
+    scope,
+    conversation,
+    inputData
+  );
+
+  conversation.lastMessageId = message.id;
+  let noOfMessages =
+    message.info.botResponse.length +
+    (message.info.requestData && message.info.requestData.message ? 1 : 0);
+
+  var convP = scope.conversation.update({
+    context: contextObj,
+    memory: memory,
+    lastMessageId: message.id,
+    noOfMessages: conversation.noOfMessages + noOfMessages,
+  });
+
+  var ret = await convP;
+  Monitor.observeElapsedTime(
+    "conversation_storage_time",
+    [scope.bot.id],
+    start
+  );
+  return Promise.resolve(ret);
+}
+
+async function storeMessages(data, orgId) {
+  var scope = this;
+  orgId = orgId || scope.bot.botInfo.orgId;
+  var start = Date.now();
+  var Message = await TenantDbManager.getModel(orgId, "Message");
+  var message = await Message.insert(data);
+  Monitor.observeElapsedTime("message_storage_time", [scope.bot.id], start);
+  return Promise.resolve(message);
+}
+
+async function storeMessagesAndContext(msgData) {
+  var scope = this;
+  var msg = await storeMessages.call(scope, msgData);
+  await storeContext.call(scope, msg);
+  return msg;
+}
+
+async function buildMessages() {
+  var scope = this;
+  var bot = scope.bot;
+  var executedIntent = scope.executedIntent;
+  var similarityInfo = scope.similarityInfo;
+  var confidence = scope.confidence;
+  var integration = scope.req.body.integration || "web";
+  var conversation = scope.conversation;
+
+  // TODO check and call dialog response or bot response builder functions
+  var botResponse = await ResponderComponent.buildResponse(scope);
+
+  var botId = (bot.settings && bot.settings.outboundId) || bot.id;
+
+  var didFallback =
+    executedIntent &&
+    executedIntent.isFallback &&
+    _.isEmpty(scope.discoveryMessages);
+
+  if (didFallback) {
+    Monitor.observe("bot_fallback_confidence", [botId], confidence);
+  }
+
+  if (didFallback && !_.isEmpty(scope.suggestedIntents)) {
+    _.set(scope, "resInfo.resolution", "sm");
+  }
+
+  var messageType = scope.req.body.messageType;
+  var instanceName = scope.req.body.instanceName;
+  var sentMessage = "";
+  for (let msg of botResponse) {
+    var txt = _.isArray(msg.text) ? msg.text[0] : msg.text;
+    if (sentMessage !== "") {
+      sentMessage = sentMessage + "," + txt;
+    } else {
+      sentMessage = txt;
+    }
+  }
+  var processingTime = Date.now() - scope.req.locals.startEpoch;
+  var processingTimes = _.get(scope.req.locals, "processingTimes");
+  var data = {
+    text: scope.message,
+    info: {
+      outboundId: botId,
+      botId: bot.id,
+      botResponse: botResponse,
+      similarityInfo: similarityInfo,
+      isFallback: executedIntent && executedIntent.isFallback,
+      confidence: confidence,
+      threshold: bot.threshold,
+      integration: integration,
+      intentId: executedIntent && executedIntent.id,
+      featureMatches:
+        _.get(similarityInfo, "featureMatches") ||
+        _.get(scope, "featureMatches"),
+      correctionInfo: _.get(scope, "nlp.correctionInfo"),
+      originalMessage: scope.originalMessage,
+      entityMaches: _.chain(scope.entityMaches).map((e) => {
+        return _.pick(e, ["ng", "name", "id", "matched_tokens", "botId"]);
+      }),
+      requestData: scope.req.body,
+      pendingInfo: PendingInfoHandler.getCurrentPendingInfo(scope),
+    },
+    debugInfo: {
+      fmInfo: scope.featureMatchInfo,
+      clsInfo: _.get(scope, "nlp.similarityInfo"),
+      resInfo: _.get(scope, "resInfo"),
+      cnInfo: _.get(scope, "cnInfo"),
+      lngInfo: _.get(scope, "nlp.lngInfo"),
+      sentimentInfo: _.get(scope, "nlp.sentimentInfo"),
+      respInfo: {
+        response: _.get(scope.responseInfo, "lngInfo.label"),
+        qr: _.get(scope.responseInfo, "lngInfo.qrLabel"),
+        template: _.get(scope.responseInfo, "template"),
+        context: scope.responseContext,
+      },
+      processingTime,
+      processingTimes,
+    },
+    conversationId: conversation.id,
+    botId: botId,
+    didFallback: didFallback,
+    type: messageType,
+    instanceName: instanceName,
+    sentMessage: sentMessage,
+  };
+  return data;
+}
+
+function getBestIntentForInput(bot, input, data) {
+  debug("finding best intent match for input " + input);
+  return Promise.resolve(logicadapters(bot, input, data)).then(async function (
+    matchingIntent
+  ) {
+    data.matchingIntent = await ContextManagerComponent.evaluateMatchingIntent(
+      data,
+      matchingIntent
+    );
+  });
+}
+
+async function handleAgentOfflineMessage() {
+  var scope = this;
+  var offlineIntentId = _.get(
+    scope.bot.settings.liveAgentConfig,
+    "ozonetel.offlineFlowId"
+  );
+  scope.matchingIntent = await scope.Intent.getIntentForBot(
+    scope.bot.id,
+    offlineIntentId
+  );
+  var intentData;
+  var executionContextData = await ExecutionContextProvider.getForActions(
+    scope
+  );
+  await updateMemory(scope);
+  intentData = await IntentActionsComponent.executeActions(
+    scope,
+    executionContextData
+  );
+  scope.inputData = intentData;
+  scope.executedIntent = intentData.executedIntent;
+  return scope;
+}
+
+async function handleIntentActions() {
+  var scope = this;
+  //this will happen when we retain info from discoveryContext
+  if (!scope.matchingIntent && !scope.isPaylodRequest && !scope.isFileRequest) {
+    debug("matching intent not found and is not a payload request");
+    return;
+  }
+
+  var start = Date.now();
+  var bot = scope.bot;
+  if (!scope.matchingIntent) {
+    scope.matchingIntent = await scope.Intent.getById(
+      _.get(
+        scope,
+        "conversation.context.dialogContext.inputData.executedIntent"
+      )
+    );
+  }
+  var contextNodes = _.get(scope, "contextNodes");
+  var pendingNodes = _.get(
+    scope,
+    "conversation.context.dialogContext.inputData.pendingNodes"
+  );
+  var isSameAsPending =
+    scope.matchingIntent.id ===
+    _.get(scope, "conversation.context.dialogContext.inputData.pendingIntent");
+  var canContinueIntent = scope.matchingIntent.isFallback || isSameAsPending;
+  var hasContextNodes =
+    !_.isEmpty(contextNodes) || (!_.isEmpty(pendingNodes) && canContinueIntent);
+  var resetBotMemory = _.get(scope.matchingIntent, "settings.resetMemory");
+  var previousIntentId = _.get(
+    scope,
+    "conversation.context.dialogContext.previousIntent.id"
+  );
+  var isInContext =
+    _.get(scope.matchingIntent, "id") === previousIntentId && hasContextNodes;
+  if (!isSameAsPending && !isInContext && resetBotMemory) {
+    await ConversationMemoryHandler.resetBotMemory(scope, scope.conversation);
+    debug(
+      "did reset memory befor handling flow to name %s",
+      scope.matchingIntent.name
+    );
+    debug(scope.conversation.memory);
+  }
+
+  var inputData;
+  if (hasContextNodes) {
+    debug("contextNodes available");
+    inputData = await ContextNodesComponent.executeNodes(scope);
+  } else {
+    debug(
+      "no contextNodes in current or pending scope nodes cannot be used, execute new actions"
+    );
+    var executionContext = await ExecutionContextProvider.getForActions(scope);
+    // see if we are breaking context
+    if (executionContext.shouldBreakContext()) {
+      // if we are breaking context then store the previous data in conversation memory
+      await ConversationMemoryHandler.persistPendingActionData(
+        _.get(scope, "conversation")
+      );
+    }
+    await updateMemory(scope);
+    inputData = await IntentActionsComponent.executeActions(
+      scope,
+      executionContext
+    );
+  }
+
+  scope.executedIntent = inputData.executedIntent;
+  if (!scope.matchingIntent) {
+    scope.matchingIntent = await scope.Intent.getById(inputData.executedIntent);
+  }
+  Monitor.observeElapsedTime(
+    "actions_execution_time",
+    [bot.id, scope.matchingIntent.id],
+    start
+  );
+
+  // TODO add info for building messages for input params
+  if (scope.priorResults) {
+    var collatedResults = new ExecutionResults();
+    _.transform(
+      scope.priorResults.results,
+      (acc, v, k) => {
+        // add to collated results only when messages are present as results with empty messages
+        // are causing order to be mixed up when we come back to the initial flow
+        if (!_.isEmpty(v.messages)) {
+          collatedResults[k] = v;
+        }
+      },
+      {}
+    );
+    _.transform(
+      scope.currentExecutionResults,
+      (acc, v, k) => {
+        var existingMessages = _.get(collatedResults[k], "messages");
+        collatedResults[k] = v;
+        if (!_.isEmpty(existingMessages)) {
+          collatedResults[k].messages = _.concat(existingMessages, v.messages);
+        }
+      },
+      {}
+    );
+    scope.currentExecutionResults = collatedResults;
+    scope.resultsBeforeRestart = undefined;
+  }
+
+  scope.inputData = inputData;
+  if (inputData.pendingInput) {
+    debug("waiting for user input");
+    var promptsContext = PromptsHandler.evaluateState(scope, bot);
+    if (PromptsHandler.hasExhausted(promptsContext)) {
+      debug("reached maximum prompt count, cleanup input state");
+      scope.inputData = undefined;
+      scope.promptsContext = undefined;
+      scope.currentExecutionResults = undefined;
+      scope.resultsBeforeRestart = undefined;
+      scope.priorResults = new ExecutionResults();
+      var contextObject = _.get(scope, "conversation.context");
+      _.set(contextObject, "dialogContext.inputData", undefined);
+      _.set(contextObject, "promptsContext", undefined);
+      await scope.conversation.update({ context: contextObject });
+      var flowFallback = _.get(
+        inputData.executedIntent,
+        "settings.flowFallback.enabled"
+      );
+      var fallbackIntentId = _.get(
+        inputData.executedIntent,
+        "settings.flowFallback.flowId"
+      );
+      var shouldFallback = _.get(scope, "req.body.shouldFallback");
+      if ((flowFallback || shouldFallback) && !_.isEmpty(fallbackIntentId)) {
+        scope.matchingIntent = await scope.Intent.getIntentForBot(
+          bot.id,
+          fallbackIntentId
+        );
+      }
+      if (_.isEmpty(scope.matchingIntent) || shouldFallback) {
+        scope.matchingIntent = await scope.Intent.getFallbackIntentForBot(
+          bot.id
+        );
+      }
+      scope.contextNodes = undefined;
+      //delete scope.conversation.context.dialogContext.inputData;
+      return handleIntentActions.call(scope);
+    } else {
+      scope.promptsContext = promptsContext;
+    }
+    debug("still waiting for params");
+  } else if (inputData.handleActionsWithIntent) {
+    var newMatchId = inputData.handleActionsWithIntent.id;
+    if (_.get(inputData, "isGoToFlow") && !!previousIntentId) {
+      var contxtObject = _.get(scope, "conversation.context");
+      var prevIntentDetectedLanguage = _.get(
+        scope,
+        "conversation.context.dialogContext.languageContext.trigger." +
+          previousIntentId
+      );
+      _.set(
+        contxtObject,
+        "dialogContext.languageContext.trigger." + newMatchId,
+        prevIntentDetectedLanguage
+      );
+      await scope.conversation.update({ context: contxtObject });
+    }
+    var key = `handleActionsWithIntentContext.${newMatchId}`;
+    var isExecutedOnce = _.get(scope, key);
+    if (!isExecutedOnce) {
+      debug(
+        "executing go to flow to name %s",
+        inputData.handleActionsWithIntent.name
+      );
+      scope.inputData = undefined;
+      scope.promptsContext = undefined;
+      scope.priorResults = {
+        results: scope.currentExecutionResults,
+        intentId: scope.matchingIntent.id,
+      };
+      _.set(scope, "conversation.context.dialogContext.inputData", undefined);
+      scope.matchingIntent = inputData.handleActionsWithIntent;
+      scope.contextNodes = undefined;
+      _.set(scope, key, true);
+      return handleIntentActions.call(scope);
+    } else {
+      debug(
+        "already executed handleActionsWithIntent for intent %s",
+        inputData.handleActionsWithIntent.id
+      );
+    }
+  } else {
+    // context check and add message to continue with context
+    await ContextMessageProvider.addContextMessage(scope, executionContext);
+  }
+}
+
+async function handleKbContext() {
+  var scope = this;
+  var bot = scope.bot;
+  var message = scope.message;
+  var isHandled = scope.isHandled;
+
+  if (isHandled) {
+    debug("message is already handled, return");
+    return;
+  }
+
+  // TODO check for pending input param responses
+  // don't call for logic adapters if waiting for input params
+  // for fresh input, once the best response is found check the best intent for
+  // input params and pass input through param extractors
+
+  var kbP;
+  var inputData = _.get(scope, "conversation.context.dialogContext.inputData");
+  if (_.get(inputData, "pendingInput")) {
+    debug("checking for availability of pending param");
+    var action = _.get(inputData, "pendingActionInfo");
+    var pendingNodes = _.get(
+      scope,
+      "conversation.context.dialogContext.inputData.pendingNodes"
+    );
+    if (!action && !_.isEmpty(pendingNodes)) {
+      action = { id: pendingNodes[0] };
+    }
+    var canExecutePendingIntent =
+      await ContextManagerComponent.canExecutePendingIntent(
+        scope,
+        inputData,
+        action
+      );
+    if (canExecutePendingIntent) {
+      debug("found pending param, execute pending intent");
+      scope.matchingIntent = await scope.Intent.getById(
+        _.get(inputData, "pendingIntent")
+      );
+      return;
+    }
+  }
+
+  kbP = getBestIntentForInput(bot, message, scope)
+    .bind(scope)
+    .then(() => {
+      // As the original input is resulting in fallback match try matching with previous context
+      var conversation = scope.conversation;
+      var dialogContext =
+        conversation.context && conversation.context.dialogContext;
+
+      // if the matching check if the previous intent can handle the
+      return ContextManagerComponent.canExecutePreviousIntent(scope).then(
+        (canExecute) => {
+          if (canExecute) {
+            // assing the matching intent to previous intent
+            debug("assigning matching intent to previous intent");
+            scope.matchingIntent =
+              ContextManagerComponent.getPreviousIntent(scope);
+          } else if (
+            _.get(dialogContext, "attributes") ||
+            _.get(dialogContext, "features")
+          ) {
+            var originalMatch = scope.matchingIntent;
+            var originalSuggestions = scope.suggestedIntents;
+            scope.suggestedIntents = undefined;
+            debug("verfiying for intent match with previous attributes");
+            var contextMessage =
+              message +
+              " " +
+              (dialogContext.attributes ||
+                _.join(_.map(dialogContext.features, "token"), " "));
+            var previousFeatures = _.get(dialogContext, "features");
+            if (previousFeatures) {
+              scope.previousIntentForFeatures = previousFeatures[0].intentId;
+            }
+            return Promise.resolve(
+              NLPComponent.process(contextMessage, bot, scope)
+            )
+              .bind(scope)
+              .then((res) => {
+                scope.nlp = res;
+                return getBestIntentForInput(bot, contextMessage, scope);
+              })
+              .then(() => {
+                var isFallingBack = _.get(scope, "matchingIntent.isFallback");
+                if (isFallingBack) {
+                  scope.matchingIntent = originalMatch;
+                  scope.suggestedIntents = originalSuggestions;
+                }
+              });
+          }
+        }
+      );
+    });
+
+  //check for enable wiki discovery
+  if (bot.settings.enableWikiDiscovery) {
+    var intentstobetriggered = scope.nlp.intentInfo.intent;
+    var wikiscope = await WikiComponent.getWikiresults(
+      scope,
+      intentstobetriggered
+    );
+    var wikiP = Promise.resolve(wikiscope);
+  }
+
+  return Promise.join(kbP, wikiP, () => {});
+}
+
+function validateAgentTimings(scope) {
+  var agentAvailable;
+  const currentDate = moment().utcOffset(UTCOFFSET).toString();
+  const today = moment(currentDate).format("ddd");
+  if (
+    scope.bot.settings.liveAgentConfig.ozonetel.workingDays.indexOf(
+      today.toLowerCase()
+    ) >= 0
+  ) {
+    var startHrs = _.get(
+      scope.bot.settings,
+      "liveAgentConfig.ozonetel.workingHours.startHour"
+    );
+    var startMins = _.get(
+      scope.bot.settings,
+      "liveAgentConfig.ozonetel.workingHours.startMin"
+    );
+    var startSecs =
+      _.get(
+        scope.bot.settings,
+        "liveAgentConfig.ozonetel.workingHours.startSec"
+      ) || 0;
+    var endHrs = _.get(
+      scope.bot.settings,
+      "liveAgentConfig.ozonetel.workingHours.endHour"
+    );
+    var endMins = _.get(
+      scope.bot.settings,
+      "liveAgentConfig.ozonetel.workingHours.endMin"
+    );
+    var endSecs =
+      _.get(
+        scope.bot.settings,
+        "liveAgentConfig.ozonetel.workingHours.endSec"
+      ) || 0;
+    var StartUtcTime = moment()
+      .utcOffset(UTCOFFSET)
+      .startOf("day")
+      .add(startHrs, "h")
+      .add(startMins, "m")
+      .add(startSecs, "s");
+    var EndUtcTime = moment()
+      .utcOffset(UTCOFFSET)
+      .startOf("day")
+      .add(endHrs, "h")
+      .add(endMins, "m")
+      .add(endSecs, "s");
+    agentAvailable = moment()
+      .utcOffset(UTCOFFSET)
+      .isBetween(StartUtcTime, EndUtcTime);
+    return agentAvailable;
+  }
+}
+
+async function processMessage() {
+  var scope = this;
+  var originalMessage, message;
+  var bot = scope.bot;
+  var db = await TenantDbManager.getDb(bot.botInfo.orgId);
+  if (scope.req.body.flowId) {
+    var intent = await db.Intent.getIntentForBot(bot.id, scope.req.body.flowId);
+    message = _.sample(intent.inputs);
+    originalMessage = message;
+  } else {
+    message = scope.req.body.message;
+    originalMessage = scope.req.body.message;
+  }
+  message = message.replace(/\s+/g, " ");
+  scope.originalMessage = originalMessage.trim();
+  // eslint-disable-next-line no-useless-escape
+  scope.message = message
+    .toLowerCase()
+    .replace(/[\\!\\.\\,?\\/\\"\]\\}\\[\\>\\<\\:\\;\\(\\)]/g, " ")
+    .trim();
+  scope.auth = _.get(scope.req.body, "auth") || {};
+  scope.lang = franc(message, {
+    whitelist: ["eng", "hin", "tel"],
+    minLength: 3,
+  });
+  if (
+    _.get(scope.bot.settings, "liveAgentConfig.ozonetel.isOffline") &&
+    _.get(scope.bot.settings, "liveAgentConfig.ozonetel.workingDays")
+  ) {
+    var agentAvailable = await validateAgentTimings(scope);
+    if (!agentAvailable) {
+      return Promise.resolve(scope)
+        .then(_.partial(NLPComponent.process, message, bot))
+        .then((res) => {
+          scope.nlp = res;
+          return res;
+        })
+        .bind(scope)
+        .then(handleKbContext)
+        .then(handleAgentOfflineMessage)
+        .then(buildMessages);
+    }
+  }
+  return Promise.resolve(scope)
+    .then(_.partial(NLPComponent.process, message, bot))
+    .then((res) => {
+      scope.nlp = res;
+      return res;
+    })
+    .bind(scope)
+    .then(handleKbContext)
+    .then(handleIntentActions)
+    .then(buildMessages);
+}
+
+async function getBotAndConversation() {
+  var scope = this;
+  var req = scope.req;
+  var botId = req.params.botId;
+  var start = Date.now();
+
+  var BotInfo = await AuthDbManager.getBotInfoModel();
+
+  var botInfo = await BotInfo.getByBotId(botId);
+  var orgId = botInfo.orgId;
+
+  var db = await TenantDbManager.getDb(orgId);
+  var Bot = db.Bot;
+  var Conversation = db.Conversation;
+
+  scope.Conversation = Conversation;
+
+  scope.Intent = db.Intent;
+  scope.Fulfillment = db.Fulfillment;
+  scope.Entity = db.Entity;
+  scope.ContextNode = db.ContextNode;
+  scope.Service = db.Service;
+  scope.ServicePaths = db.ServicePaths;
+
+  var cachedBot = MemCache.getBot(botId);
+  var botP = cachedBot
+    ? Promise.resolve(cachedBot)
+    : Bot.getByOutboundId(botId);
+  var sessionId = req.body.sessionId;
+  if (!sessionId) {
+    debug("session id not available from client, using server session id");
+    sessionId = req.session ? req.session.id : "";
+  }
+  if (_.get(req.body, "isSessionEncoded")) {
+    //sessionId = decodeURIComponent(sessionId);
+    var buff = Buffer(sessionId, "base64");
+    sessionId = buff.toString("ascii");
+    req.body.sessionId = _.escape(sessionId);
+  }
+  scope.sessionId = sessionId;
+  if (req.body.integration !== "console") {
+    await eventUtils.createOrUpdateConvCounter(
+      sessionId,
+      botId,
+      req.body.integration
+    );
+  }
+  var convP = Conversation.getBotConversation(
+    sessionId,
+    botId,
+    req.body.integration
+  );
+
+  return Promise.join(botP, convP, (bot, conv) => {
+    if (!bot) {
+      // TODO decide about converstion if bot is not available
+      return Promise.reject(errors(404, "bot with id not found"));
+    }
+
+    bot.botInfo = botInfo;
+    scope.bot = bot;
+    scope.orgId = orgId;
+    scope.conversation = conv;
+    scope.conversation.context = scope.conversation.context || {};
+    scope.conversation.context.dialogContext =
+      scope.conversation.context.dialogContext || {};
+    scope.conversation.context.dialogContext.actionContext =
+      scope.conversation.context.dialogContext.actionContext || {};
+    Monitor.observeElapsedTime("bot_query_time", [botId], start);
+    return bot;
+  });
+}
+
+async function handlePayloadRequest(req) {
+  var scope = ProcessingScopeBuilder.buildForPayloadRequest(req);
+  return Promise.resolve()
+    .bind(scope)
+    .then(getBotAndConversation)
+    .then(() => {
+      debug("payload is %j", req.body.payload);
+      var selectedOptions = req.body.payload.selectedOptions;
+      var resultComment = _.isArray(selectedOptions)
+        ? _.chain(selectedOptions)
+            .map("postback.payload.resultComment")
+            .join(" ")
+            .value()
+        : _.get(selectedOptions, "postback.payload.resultComment");
+      debug("resultComment from payload is %s", resultComment);
+      if (!_.isEmpty(resultComment)) {
+        resultComment = resultComment.toLowerCase();
+        scope.message = resultComment;
+        scope.originalMessage = resultComment;
+        // When there is comment in payload process with nlp
+        return NLPComponent.process(resultComment, scope.bot, scope).then(
+          (res) => {
+            scope.nlp = res;
+            return res;
+          }
+        );
+      }
+    })
+    .bind(scope)
+    .then(handleIntentActions)
+    .then(buildMessages)
+    .then((data) => {
+      return storeMessagesAndContext.call(scope, data);
+    })
+    .then(sendResponse);
+}
+
+async function handleMessageRequest(req) {
+  var scope = ProcessingScopeBuilder.buildForRequest(req);
+  if (!scope.messageType) {
+    var messageCache = MemCache.getMessage(
+      req.params.botId,
+      getMessageCacheKey(scope)
+    );
+    if (messageCache) {
+      return Promise.resolve(messageCache.resp);
+    }
+  }
+  scope.botId = req.params.botId;
+  var cacheData = {};
+  return Promise.resolve()
+    .bind(scope)
+    .then(getBotAndConversation)
+    .then(processMessage)
+    .then((data) => {
+      cacheData.messageData = data;
+      return storeMessagesAndContext.call(scope, data);
+    })
+    .tap(checkForFallbackNotification)
+    .then(sendResponse)
+    .tap((resp) => {
+      cacheData.resp = resp;
+      checkAndCacheMessage(scope, cacheData);
+    });
+}
+
+async function handleFileRequest(req) {
+  var scope = ProcessingScopeBuilder.buildForFileRequest(req);
+  return Promise.resolve()
+    .bind(scope)
+    .then(getBotAndConversation)
+    .then(async function () {
+      var pendingIntentId = _.get(
+        scope,
+        "conversation.context.dialogContext.inputData.pendingIntent"
+      );
+      scope.matchingIntent = pendingIntentId
+        ? await scope.Intent.getById(pendingIntentId)
+        : await scope.Intent.getFallbackIntentForBot(scope.bot.id);
+      return scope;
+    })
+    .bind(scope)
+    .then(handleIntentActions)
+    .then(buildMessages)
+    .then((data) => {
+      return storeMessagesAndContext.call(scope, data);
+    })
+    .then(sendResponse);
+}
+
+async function handleEventRequest(req) {
+  var eventName = _.get(req, "body.event.name");
+  if (!eventName) {
+    return Promise.reject(new errors.BadRequest("event name is missing"));
+  }
+
+  var scope = ProcessingScopeBuilder.buildForEventRequest(req);
+
+  var messageCache = MemCache.getEventMessage(
+    req.params.botId,
+    getMessageCacheKey(scope)
+  );
+  if (messageCache) {
+    await updateMemory(scope);
+    return Promise.resolve(messageCache.resp);
+  }
+
+  var cacheData = {};
+  return Promise.resolve()
+    .bind(scope)
+    .then(getBotAndConversation)
+    .then((bot) => {
+      scope.bot = bot;
+      // get intent matching the event
+      var cacheIntent = MemCache.getEventIntent(bot.id, eventName);
+      if (cacheIntent) {
+        debug("found event in intent cache %j", cacheIntent);
+      }
+      var start = Date.now();
+      return (
+        cacheIntent
+          ? Promise.resolve(cacheIntent)
+          : scope.Intent.getIntentForEvent(bot.id, eventName)
+      ).then((intent) => {
+        Monitor.observeElapsedTime(
+          "event_intent_query_time",
+          [bot.id, eventName],
+          start
+        );
+        if (!intent) {
+          return Promise.reject(
+            new errors.NotFound("Intent with matching event not found")
+          );
+        }
+
+        if (intent && !cacheIntent) {
+          MemCache.setEventIntent(bot.id, eventName, intent);
+        }
+
+        debug("found bot and intent for event based query");
+        scope.matchingIntent = intent;
+        return;
+      });
+    })
+    .then(handleIntentActions)
+    .then(buildMessages)
+    .then((data) => {
+      cacheData.messageData = data;
+      return storeMessagesAndContext.call(scope, data);
+    })
+    .then(sendResponse)
+    .tap((resp) => {
+      cacheData.resp = resp;
+      checkAndCacheMessage(scope, cacheData);
+    });
+}
+
+async function handlePaymentRequest(req) {
+  debug("handling payment message request");
+  var scope = ProcessingScopeBuilder.buildForPaymentRequest(req);
+  return Promise.resolve()
+    .bind(scope)
+    .then(getBotAndConversation)
+    .then((bot) => {
+      scope.bot = bot;
+      // create a message data
+      var paymentState = _.get(scope, "req.body.paymentState");
+      var botResponse = ResponderComponent.buildPaymentResponse(
+        bot,
+        paymentState
+      );
+      return {
+        text: paymentState,
+        info: {
+          outboundId: req.params.botId,
+          botId: bot.id,
+          botResponse: botResponse,
+          isFallback: false,
+          threshold: bot.threshold,
+          integration: _.get(req, "body.integration"),
+        },
+        conversationId: scope.conversation.id,
+        botId: scope.bot.id,
+        didFallback: false,
+      };
+    })
+    .then(storeMessages)
+    .then(sendResponse)
+    .then((msg) => {
+      return {
+        msg: msg,
+        data: scope,
+      };
+    });
+}
+
+async function handleRequest(req) {
+  try {
+    if (req.headers) {
+      if (USELOCAL) {
+        req = await FileUploadMiddleware.local(req);
+      } else {
+        req = await FileUploadMiddleware.cloud(req);
+      }
+    }
+  } catch (err) {
+    debug("error while checking for files");
+    debug(err);
+  }
+  if (!req.locals) {
+    req.locals = {
+      startEpoch: Date.now(),
+      processingTimes: {},
+    };
+  }
+  var body = req.body;
+  var message = body.message;
+  body.message = _.unescape(body.message);
+  var flowId = body.flowId;
+  var payload = body.payload;
+  var paymentState = body.paymentState;
+  if (payload) {
+    return handlePayloadRequest(req);
+  } else if (body.event) {
+    return handleEventRequest(req);
+  } else if (req.file) {
+    return handleFileRequest(req);
+  } else if (!!message || !!flowId) {
+    return handleMessageRequest(req);
+  } else if (paymentState) {
+    return handlePaymentRequest(req);
+  } else {
+    return Promise.reject(
+      new errors.BadRequest("No message or event specified")
+    );
+  }
+}
+
+module.exports = handleRequest;
